@@ -28,12 +28,23 @@ def _log_cart_delete_failure(cart_id: str) -> None:
     print(f"Failed to delete cart {cart_id} after checkout")
 
 
+def _order_lines(lines: list) -> list:
+    return [
+        {
+            "product_id": line["product_id"],
+            "quantity": line["quantity"],
+            "price_minor_units": line["price_snapshot_minor_units"],
+        }
+        for line in lines
+    ]
+
+
 def _order_payload(
     body: CheckoutRequest, lines: list, total_minor_units: int, payment_reference: str
 ) -> dict:
     payload = {
         "ship_to": body.ship_to.model_dump(),
-        "lines": lines,
+        "lines": _order_lines(lines),
         "total_minor_units": total_minor_units,
         "payment_reference": payment_reference,
     }

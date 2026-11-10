@@ -155,7 +155,7 @@ def test_guest_checkout_success():
             {
                 "product_id": "prod1",
                 "quantity": 2,
-                "price_snapshot_minor_units": 1000,
+                "price_minor_units": 1000,
             }
         ],
         "total_minor_units": 2000,
@@ -192,7 +192,7 @@ def test_signed_in_checkout_success():
         {
             "product_id": "prod1",
             "quantity": 1,
-            "price_snapshot_minor_units": 1000,
+            "price_minor_units": 1000,
         }
     ]
     assert orders["order-1"]["total_minor_units"] == 1000
