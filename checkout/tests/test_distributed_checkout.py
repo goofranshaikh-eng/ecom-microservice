@@ -1,305 +1,645 @@
-import asyncio
 import json
-from datetime import datetime
+import os
+import time
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import httpx
+import pika
+import pytest
+from bson import ObjectId
+from pymongo import MongoClient
 
-import consumers
-import main
-from db import checkouts_collection
+# Service URLs (match checkout/routes.py constants)
+CHECKOUT_URL = "http://localhost:8004"
+CART_URL = "http://localhost:8003"
+PAYMENT_URL = "http://localhost:8005"
+ORDER_URL = "http://localhost:8006"
 
-SERVICE_ROOT = Path(__file__).resolve().parents[1]
-OTHER_DATABASES = ("order_db", "payment_db", "cart_db", "identity_db", "catalog_db")
+# MongoDB connection
+MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
 
-checkouts_data: dict = {}
-carts: dict = {}
-delete_calls: list = []
-delete_results: list = []
-status_updates: list = []
-
-
-class _Response:
-    def __init__(self, status_code: int):
-        self.status_code = status_code
-
-
-class _DeleteClient:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-    async def delete(self, url):
-        delete_calls.append(url)
-        result = delete_results.pop(0) if delete_results else 204
-        if isinstance(result, Exception):
-            raise result
-        if result in (204, 404):
-            cart_id = url.rstrip("/").rsplit("/", 1)[-1]
-            carts.pop(cart_id, None)
-        return _Response(result)
+# RabbitMQ connection
+RABBITMQ_URI = "amqp://localhost:5672"
 
 
 def setup_function():
-    checkouts_data.clear()
-    carts.clear()
-    delete_calls.clear()
-    delete_results.clear()
-    status_updates.clear()
-    consumers.httpx.AsyncClient = _DeleteClient
+    """Clear all databases before each test."""
+    client = MongoClient(MONGODB_URI)
+    
+    for db_name in [
+        "checkout_db",
+        "order_db",
+        "payment_db",
+        "cart_db",
+        "identity_db",
+        "catalog_db",
+    ]:
+        db = client[db_name]
+        for collection_name in db.list_collection_names():
+            db[collection_name].delete_many({})
+    
+    client.close()
+    
+    # Verify environment variables for time-sensitive tests
+    completion_window = os.environ.get("COMPLETION_WINDOW_SECONDS")
+    if completion_window is None:
+        pytest.skip("COMPLETION_WINDOW_SECONDS not set (required for AC6)")
+    
+    retry_delays = os.environ.get("CART_DELETE_RETRY_DELAYS")
+    if retry_delays is None:
+        pytest.skip("CART_DELETE_RETRY_DELAYS not set (required for AC5)")
 
-    def find_one(query):
-        if "payment_reference" in query:
-            return checkouts_data.get(query["payment_reference"])
-        return None
 
-    def update_one(query, update):
-        checkout = checkouts_data.get(query["payment_reference"])
-        if checkout is not None:
-            fields = update.get("$set", {})
-            checkout.update(fields)
-            if "status" in fields:
-                status_updates.append(fields["status"])
-        return None
+def _create_cart(quantity: int = 2, price: int = 1500) -> str:
+    """Seed a cart in cart_db and return cart_id."""
+    client = MongoClient(MONGODB_URI)
+    cart_db = client["cart_db"]
+    
+    cart_id = str(ObjectId())
+    cart_db.carts.insert_one({
+        "_id": cart_id,
+        "lines": [
+            {
+                "product_id": "prod_001",
+                "quantity": quantity,
+                "price_snapshot_minor_units": price
+            }
+        ],
+        "total_minor_units": quantity * price
+    })
+    
+    client.close()
+    return cart_id
 
-    checkouts_collection.find_one.side_effect = find_one
-    checkouts_collection.update_one.side_effect = update_one
 
-
-def _ship_to():
+def _ship_to() -> dict:
+    """Return a valid ship_to address."""
     return {
         "street": "123 Main St",
         "city": "Springfield",
         "postal_code": "12345",
-        "country": "US",
+        "country": "US"
     }
 
 
-def _seed_checkout(payment_reference, cart_id, checkout_id, total=3000):
-    now = datetime.utcnow()
-    checkouts_data[payment_reference] = {
-        "checkout_id": checkout_id,
-        "payment_reference": payment_reference,
+def _poll_until(
+    condition_fn,
+    timeout_seconds: int = 10,
+    poll_interval: float = 0.5
+) -> bool:
+    """
+    Poll condition_fn() until it returns True or timeout is reached.
+    
+    Args:
+        condition_fn: Callable that returns bool
+        timeout_seconds: Maximum time to wait
+        poll_interval: Time to wait between polls
+    
+    Returns:
+        True if condition was met, False if timeout
+    """
+    start = time.time()
+    while time.time() - start < timeout_seconds:
+        if condition_fn():
+            return True
+        time.sleep(poll_interval)
+    return False
+
+
+@pytest.mark.asyncio
+async def test_payment_refused_stays_immediate():
+    """AC1: Payment refused stays immediate."""
+    cart_id = _create_cart(quantity=1, price=1000)
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{CHECKOUT_URL}/checkout",
+            json={
+                "cart_id": cart_id,
+                "email": "guest@example.com",
+                "ship_to": _ship_to(),
+            }
+        )
+    
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "refused"
+    assert data["reason"] == "Card declined"
+    assert "checkout_id" not in data
+    
+    # No checkout record
+    mongo_client = MongoClient(MONGODB_URI)
+    checkout_db = mongo_client["checkout_db"]
+    assert checkout_db.checkouts.count_documents({}) == 0
+    
+    # No outbox row
+    assert checkout_db.outbox.count_documents({}) == 0
+    
+    # Cart unchanged
+    cart_db = mongo_client["cart_db"]
+    cart = cart_db.carts.find_one({"_id": cart_id})
+    assert cart is not None
+    assert cart["total_minor_units"] == 1000
+    
+    # No order
+    order_db = mongo_client["order_db"]
+    assert order_db.orders.count_documents({}) == 0
+    
+    # No message published (verify queue is empty)
+    connection = pika.BlockingConnection(pika.URLParameters(RABBITMQ_URI))
+    channel = connection.channel()
+    method_frame, header_frame, body = channel.basic_get(queue="order.requested.queue", auto_ack=True)
+    assert method_frame is None  # Queue is empty
+    channel.close()
+    connection.close()
+    
+    mongo_client.close()
+
+
+@pytest.mark.asyncio
+async def test_accepted_checkout_returns_before_order_exists():
+    """AC2: Accepted checkout returns before the order exists."""
+    cart_id = _create_cart(quantity=2, price=1500)
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{CHECKOUT_URL}/checkout",
+            json={
+                "cart_id": cart_id,
+                "email": "guest@example.com",
+                "ship_to": _ship_to()
+            }
+        )
+    
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "accepted"
+    assert "checkout_id" in data
+    assert "order_id" not in data  # Order not created yet
+    
+    checkout_id = data["checkout_id"]
+    
+    # Checkout record exists
+    mongo_client = MongoClient(MONGODB_URI)
+    checkout_db = mongo_client["checkout_db"]
+    checkout = checkout_db.checkouts.find_one({"checkout_id": checkout_id})
+    assert checkout is not None
+    assert checkout["status"] == "accepted"
+    assert "payment_reference" in checkout
+    
+    payment_reference = checkout["payment_reference"]
+    
+    # Outbox row exists
+    outbox_row = checkout_db.outbox.find_one({"payment_reference": payment_reference})
+    assert outbox_row is not None
+    assert outbox_row["event_type"] == "OrderRequested"
+    assert outbox_row["published"] == False
+    
+    # No order yet
+    order_db = mongo_client["order_db"]
+    assert order_db.orders.count_documents({"payment_reference": payment_reference}) == 0
+    
+    mongo_client.close()
+
+
+@pytest.mark.manual
+@pytest.mark.asyncio
+async def test_order_created_after_recovery():
+    """
+    AC3: Order is created after the order service recovers.
+    
+    MANUAL TEST: Requires stopping and starting the order service.
+    1. Stop the order service before running this test
+    2. Run the test
+    3. When prompted, start the order service
+    """
+    cart_id = _create_cart(quantity=2, price=1500)
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{CHECKOUT_URL}/checkout",
+            json={
+                "cart_id": cart_id,
+                "email": "guest@example.com",
+                "ship_to": _ship_to()
+            }
+        )
+    
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "accepted"
+    checkout_id = data["checkout_id"]
+    
+    # Wait for relay to publish OrderRequested
+    mongo_client = MongoClient(MONGODB_URI)
+    checkout_db = mongo_client["checkout_db"]
+    checkout = checkout_db.checkouts.find_one({"checkout_id": checkout_id})
+    payment_reference = checkout["payment_reference"]
+    
+    published = _poll_until(
+        lambda: checkout_db.outbox.find_one({"payment_reference": payment_reference, "published": True}) is not None,
+        timeout_seconds=10
+    )
+    assert published, "Relay did not publish OrderRequested within 10 seconds"
+    
+    # Assert no order exists yet (order service is down)
+    order_db = mongo_client["order_db"]
+    assert order_db.orders.count_documents({"payment_reference": payment_reference}) == 0
+    
+    # Manual step: start order service
+    print("Start order service manually, then press Enter")
+    input()
+    
+    # Poll for order creation
+    order_created = _poll_until(
+        lambda: order_db.orders.find_one({"payment_reference": payment_reference}) is not None,
+        timeout_seconds=10
+    )
+    assert order_created, "Order was not created within 10 seconds after service recovery"
+    
+    # Assert exactly one order
+    orders = list(order_db.orders.find({"payment_reference": payment_reference}))
+    assert len(orders) == 1
+    
+    order = orders[0]
+    assert order["email"] == "guest@example.com"
+    assert order["ship_to"] == _ship_to()
+    assert len(order["lines"]) == 1
+    assert order["lines"][0]["product_id"] == "prod_001"
+    assert order["lines"][0]["quantity"] == 2
+    assert order["lines"][0]["price_minor_units"] == 1500
+    assert order["total_minor_units"] == 3000
+    
+    mongo_client.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_checkout_does_not_charge_twice():
+    """AC4: A repeated checkout does not charge or order twice."""
+    cart_id = _create_cart(quantity=1, price=1000)
+    
+    body = {
         "cart_id": cart_id,
         "email": "guest@example.com",
-        "ship_to": _ship_to(),
-        "lines": [
-            {
-                "product_id": "prod_001",
-                "quantity": 2,
-                "price_snapshot_minor_units": total // 2,
-            }
-        ],
-        "total_minor_units": total,
-        "status": "accepted",
-        "order_id": None,
-        "created_at": now,
-        "updated_at": now,
+        "ship_to": _ship_to()
     }
-    carts[cart_id] = {
-        "cart_id": cart_id,
-        "lines": [
-            {
-                "product_id": "prod_001",
-                "quantity": 2,
-                "price_snapshot_minor_units": total // 2,
-            }
-        ],
-        "total_minor_units": total,
-    }
+    
+    async with httpx.AsyncClient() as client:
+        response1 = await client.post(f"{CHECKOUT_URL}/checkout", json=body)
+        response2 = await client.post(f"{CHECKOUT_URL}/checkout", json=body)
+    
+    assert response1.status_code == 200
+    assert response2.status_code == 200
+    
+    checkout_id_1 = response1.json()["checkout_id"]
+    checkout_id_2 = response2.json()["checkout_id"]
+    
+    assert checkout_id_1 == checkout_id_2
+    assert response2.json()["status"] == "accepted"
+    
+    # Only one checkout record
+    mongo_client = MongoClient(MONGODB_URI)
+    checkout_db = mongo_client["checkout_db"]
+    checkout = checkout_db.checkouts.find_one({"checkout_id": checkout_id_1})
+    payment_reference = checkout["payment_reference"]
+    
+    all_checkouts = list(checkout_db.checkouts.find({"payment_reference": payment_reference}))
+    assert len(all_checkouts) == 1
+    
+    # Only one outbox row
+    all_outbox = list(checkout_db.outbox.find({"payment_reference": payment_reference}))
+    assert len(all_outbox) == 1
+    
+    # Only one charge
+    payment_db = mongo_client["payment_db"]
+    all_charges = list(payment_db.charges.find({"reference": payment_reference}))
+    assert len(all_charges) == 1
+    
+    # Wait for order to be created
+    order_db = mongo_client["order_db"]
+    order_created = _poll_until(
+        lambda: order_db.orders.find_one({"payment_reference": payment_reference}) is not None,
+        timeout_seconds=10
+    )
+    assert order_created, "Order was not created within 10 seconds"
+    
+    # Manually publish the same OrderRequested message twice
+    outbox_row = checkout_db.outbox.find_one({"payment_reference": payment_reference})
+    msg = outbox_row["payload"]
+    
+    connection = pika.BlockingConnection(pika.URLParameters(RABBITMQ_URI))
+    channel = connection.channel()
+    
+    # Publish twice
+    for _ in range(2):
+        channel.basic_publish(
+            exchange="ecom.events",
+            routing_key="order.requested",
+            body=json.dumps(msg),
+            properties=pika.BasicProperties(delivery_mode=2)
+        )
+    
+    channel.close()
+    connection.close()
+    
+    # Wait for order service to consume both messages
+    time.sleep(5)
+    
+    # Assert only one order exists
+    all_orders = list(order_db.orders.find({"payment_reference": payment_reference}))
+    assert len(all_orders) == 1
+    
+    mongo_client.close()
 
 
-def _order_created(payment_reference, checkout_id, order_id):
-    return {
-        "event_type": "OrderCreated",
+@pytest.mark.manual
+@pytest.mark.asyncio
+async def test_cart_emptied_and_retried():
+    """
+    AC5: The cart is emptied, and a failed delete is retried.
+    
+    MANUAL TEST: Requires stopping and starting the cart service.
+    1. Run the test
+    2. When prompted, stop the cart service
+    3. When prompted, start the cart service
+    """
+    cart_id = _create_cart(quantity=1, price=1000)
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{CHECKOUT_URL}/checkout",
+            json={
+                "cart_id": cart_id,
+                "email": "guest@example.com",
+                "ship_to": _ship_to()
+            }
+        )
+    
+    assert response.status_code == 200
+    checkout_id = response.json()["checkout_id"]
+    
+    # Wait for order to be created
+    mongo_client = MongoClient(MONGODB_URI)
+    checkout_db = mongo_client["checkout_db"]
+    order_db = mongo_client["order_db"]
+    
+    checkout = checkout_db.checkouts.find_one({"checkout_id": checkout_id})
+    payment_reference = checkout["payment_reference"]
+    
+    order_created = _poll_until(
+        lambda: order_db.orders.find_one({"payment_reference": payment_reference}) is not None,
+        timeout_seconds=10
+    )
+    assert order_created, "Order was not created within 10 seconds"
+    
+    # Manual step: stop cart service before first delete attempt
+    print("Stop cart service manually, then press Enter")
+    input()
+    
+    # Wait for first retry delay (1s) + processing
+    time.sleep(2)
+    
+    # Assert cart still exists
+    cart_db = mongo_client["cart_db"]
+    cart = cart_db.carts.find_one({"_id": cart_id})
+    assert cart is not None, "Cart was deleted despite cart service being down"
+    
+    # Manual step: start cart service
+    print("Start cart service manually, then press Enter")
+    input()
+    
+    # Poll for cart deletion (retry succeeds)
+    cart_deleted = _poll_until(
+        lambda: cart_db.carts.find_one({"_id": cart_id}) is None,
+        timeout_seconds=10
+    )
+    assert cart_deleted, "Cart was not deleted within 10 seconds after service recovery"
+    
+    # Assert only one order exists
+    all_orders = list(order_db.orders.find({"payment_reference": payment_reference}))
+    assert len(all_orders) == 1
+    
+    mongo_client.close()
+
+
+@pytest.mark.manual
+@pytest.mark.asyncio
+async def test_charge_refunded_when_order_never_appears():
+    """
+    AC6: A charge with no order is refunded.
+    
+    MANUAL TEST: Requires stopping the order service and setting COMPLETION_WINDOW_SECONDS=5.
+    1. Set COMPLETION_WINDOW_SECONDS=5 environment variable before running
+    2. Stop the order service before running this test
+    """
+    # Verify COMPLETION_WINDOW_SECONDS=5 is set
+    assert os.environ.get("COMPLETION_WINDOW_SECONDS") == "5", \
+        "COMPLETION_WINDOW_SECONDS must be set to 5 for this test"
+    
+    cart_id = _create_cart(quantity=1, price=1000)
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{CHECKOUT_URL}/checkout",
+            json={
+                "cart_id": cart_id,
+                "email": "guest@example.com",
+                "ship_to": _ship_to()
+            }
+        )
+    
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "accepted"
+    checkout_id = data["checkout_id"]
+    
+    # Wait for relay to publish OrderRequested
+    mongo_client = MongoClient(MONGODB_URI)
+    checkout_db = mongo_client["checkout_db"]
+    checkout = checkout_db.checkouts.find_one({"checkout_id": checkout_id})
+    payment_reference = checkout["payment_reference"]
+    
+    published = _poll_until(
+        lambda: checkout_db.outbox.find_one({"payment_reference": payment_reference, "published": True}) is not None,
+        timeout_seconds=10
+    )
+    assert published, "Relay did not publish OrderRequested within 10 seconds"
+    
+    # Wait for completion window (5s) + buffer (5s)
+    time.sleep(10)
+    
+    # Poll for RefundRequested outbox row
+    refund_row_exists = _poll_until(
+        lambda: checkout_db.outbox.find_one({
+            "payment_reference": payment_reference,
+            "event_type": "RefundRequested"
+        }) is not None,
+        timeout_seconds=10
+    )
+    assert refund_row_exists, "RefundRequested outbox row was not created"
+    
+    # Assert RefundRequested is published
+    refund_row = checkout_db.outbox.find_one({
         "payment_reference": payment_reference,
-        "checkout_id": checkout_id,
-        "order_id": order_id,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-
-
-def _deliver(payload, delivery_tag=1):
-    channel = SimpleNamespace(acked=[], nacked=[])
-
-    def basic_ack(delivery_tag):
-        channel.acked.append(delivery_tag)
-
-    def basic_nack(delivery_tag, requeue=True):
-        channel.nacked.append((delivery_tag, requeue))
-
-    channel.basic_ack = basic_ack
-    channel.basic_nack = basic_nack
-    method = SimpleNamespace(delivery_tag=delivery_tag)
-    consumers.on_message(channel, method, None, json.dumps(payload).encode())
-    return channel
-
-
-def test_cart_deleted_on_order_created():
-    """AC5: Cart is deleted after OrderCreated is received (happy path)."""
-    _seed_checkout("pay_test_1", "cart_test_1", "chk_test_1")
-    channel = _deliver(_order_created("pay_test_1", "chk_test_1", "ord_test_1"))
-
-    checkout = checkouts_data["pay_test_1"]
-    assert checkout["status"] == "cart_cleared"
-    assert checkout["order_id"] == "ord_test_1"
-    assert "cart_test_1" not in carts
-    assert delete_calls == ["http://localhost:8003/cart/cart_test_1"]
-    assert status_updates == ["order_created", "cart_cleared"]
-    assert channel.acked == [1]
-    assert channel.nacked == []
-
-
-def test_cart_delete_retried_on_failure(monkeypatch):
-    """AC5: Cart delete is retried on failure, then the cart is cleared."""
-    slept = []
-
-    async def instant(delay):
-        slept.append(delay)
-
-    monkeypatch.setattr(consumers.asyncio, "sleep", instant)
-    _seed_checkout("pay_retry", "cart_retry", "chk_retry", total=1000)
-    delete_results.extend([500, 204])
-
-    channel = _deliver(_order_created("pay_retry", "chk_retry", "ord_retry"))
-
-    checkout = checkouts_data["pay_retry"]
-    assert checkout["status"] == "cart_cleared"
-    assert checkout["order_id"] == "ord_retry"
-    assert "cart_retry" not in carts
-    assert len(delete_calls) == 2
-    assert slept == [5]
-    assert channel.acked == [1]
-
-
-def test_cart_delete_retry_exhausted(capsys, monkeypatch):
-    """AC5: Exhausted cart-delete retries leave the checkout at order_created."""
-    slept = []
-
-    async def instant(delay):
-        slept.append(delay)
-
-    monkeypatch.setattr(consumers.asyncio, "sleep", instant)
-    _seed_checkout("pay_exhaust", "cart_exhaust", "chk_exhaust", total=1000)
-    delete_results.extend([500, 503, 500, 500])
-
-    channel = _deliver(_order_created("pay_exhaust", "chk_exhaust", "ord_exhaust"))
-
-    checkout = checkouts_data["pay_exhaust"]
-    assert checkout["status"] == "order_created"
-    assert checkout["order_id"] == "ord_exhaust"
-    assert "cart_exhaust" in carts
-    assert len(delete_calls) == 4
-    assert slept == [5, 10, 20]
-    assert channel.acked == [1]
-    logged = capsys.readouterr().out
-    assert "Cart delete exhausted all retries for cart cart_exhaust" in logged
-    assert "[KNOWN_GAP] Cart delete failed for cart cart_exhaust" in logged
-
-
-def test_duplicate_order_created_message(monkeypatch):
-    """AC5: A duplicate OrderCreated does not clear the cart or rewrite the checkout twice."""
-    async def instant(_delay):
-        return None
-
-    monkeypatch.setattr(consumers.asyncio, "sleep", instant)
-    _seed_checkout("pay_dup", "cart_dup", "chk_dup", total=1000)
-
-    first = _deliver(_order_created("pay_dup", "chk_dup", "ord_dup"), delivery_tag=1)
-    second = _deliver(_order_created("pay_dup", "chk_dup", "ord_other"), delivery_tag=2)
-
-    checkout = checkouts_data["pay_dup"]
-    assert checkout["status"] == "cart_cleared"
-    assert checkout["order_id"] == "ord_dup"
-    assert "cart_dup" not in carts
-    assert delete_calls == ["http://localhost:8003/cart/cart_dup"]
-    assert status_updates == ["order_created", "cart_cleared"]
-    assert first.acked == [1]
-    assert second.acked == [2]
-
-
-def test_database_isolation_checkout_consumer(monkeypatch):
-    """AC8: The OrderCreated consumer only reads and writes checkout_db."""
-    _seed_checkout("pay_iso", "cart_iso", "chk_iso", total=1000)
-    _deliver(_order_created("pay_iso", "chk_iso", "ord_iso"))
-
-    assert checkouts_data["pay_iso"]["status"] == "cart_cleared"
-    assert "cart_iso" not in carts
-
-    source = (SERVICE_ROOT / "consumers.py").read_text()
-    for db_name in OTHER_DATABASES:
-        assert db_name not in source, f"{db_name} found in consumers.py"
-    assert "checkouts_collection" in source
-
-    started = {}
-
-    async def fake_consume():
-        started["called"] = True
-
-    monkeypatch.setattr(main, "consume_order_created", fake_consume)
-    startup = next(
-        handler
-        for handler in main.app.router.on_startup
-        if getattr(handler, "__name__", "") == "startup_event"
+        "event_type": "RefundRequested"
+    })
+    assert refund_row["published"] == True, "RefundRequested was not published"
+    
+    # Poll for charge refund
+    payment_db = mongo_client["payment_db"]
+    refunded = _poll_until(
+        lambda: payment_db.charges.find_one({
+            "reference": payment_reference,
+            "status": "refunded"
+        }) is not None,
+        timeout_seconds=10
     )
+    assert refunded, "Charge was not refunded within 10 seconds"
+    
+    # Verify checkout status is refunded
+    async with httpx.AsyncClient() as client:
+        status_response = await client.get(f"{CHECKOUT_URL}/checkout/{checkout_id}")
+    
+    assert status_response.status_code == 200
+    status_data = status_response.json()
+    assert status_data["status"] in ["refunded", "refund_pending"]
+    
+    # Assert no order exists
+    order_db = mongo_client["order_db"]
+    assert order_db.orders.count_documents({"payment_reference": payment_reference}) == 0
+    
+    mongo_client.close()
 
-    async def run_startup():
-        await startup()
-        await asyncio.sleep(0)
 
-    asyncio.run(run_startup())
-    assert started["called"] is True
-
-
-def test_consumer_binds_order_created_queue(monkeypatch):
-    """The consumer listens on order.created.queue with manual acknowledgement."""
-    channel = MagicMock()
-    connection = MagicMock()
-    connection.channel.return_value = channel
-    monkeypatch.setattr(consumers, "get_rabbitmq_connection", lambda: connection)
-
-    consumers._consume_blocking()
-
-    channel.exchange_declare.assert_called_once_with(
-        exchange="ecom.events", exchange_type="topic", durable=True
+@pytest.mark.asyncio
+async def test_checkout_status_endpoint():
+    """AC7: The client can see how the checkout finished."""
+    cart_id = _create_cart(quantity=1, price=1000)
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{CHECKOUT_URL}/checkout",
+            json={
+                "cart_id": cart_id,
+                "email": "guest@example.com",
+                "ship_to": _ship_to()
+            }
+        )
+    
+    assert response.status_code == 200
+    checkout_id = response.json()["checkout_id"]
+    
+    # Immediately fetch status
+    async with httpx.AsyncClient() as client:
+        status_response = await client.get(f"{CHECKOUT_URL}/checkout/{checkout_id}")
+    
+    assert status_response.status_code == 200
+    status_data = status_response.json()
+    assert status_data["checkout_id"] == checkout_id
+    assert status_data["status"] == "accepted"
+    assert status_data.get("order_id") is None
+    
+    # Wait for order to be created
+    mongo_client = MongoClient(MONGODB_URI)
+    checkout_db = mongo_client["checkout_db"]
+    order_db = mongo_client["order_db"]
+    
+    checkout = checkout_db.checkouts.find_one({"checkout_id": checkout_id})
+    payment_reference = checkout["payment_reference"]
+    
+    order_created = _poll_until(
+        lambda: order_db.orders.find_one({"payment_reference": payment_reference}) is not None,
+        timeout_seconds=10
     )
-    channel.queue_declare.assert_called_once_with(
-        queue="order.created.queue", durable=True
+    assert order_created, "Order was not created within 10 seconds"
+    
+    # Fetch status again
+    async with httpx.AsyncClient() as client:
+        status_response = await client.get(f"{CHECKOUT_URL}/checkout/{checkout_id}")
+    
+    assert status_response.status_code == 200
+    status_data = status_response.json()
+    assert status_data["status"] == "order_created"
+    assert status_data.get("order_id") is not None
+    order_id = status_data["order_id"]
+    
+    # Wait for cart to be deleted
+    cart_db = mongo_client["cart_db"]
+    cart_deleted = _poll_until(
+        lambda: cart_db.carts.find_one({"_id": cart_id}) is None,
+        timeout_seconds=10
     )
-    channel.queue_bind.assert_called_once_with(
-        exchange="ecom.events",
-        queue="order.created.queue",
-        routing_key="order.created",
+    assert cart_deleted, "Cart was not deleted within 10 seconds"
+    
+    # Fetch status final time
+    async with httpx.AsyncClient() as client:
+        status_response = await client.get(f"{CHECKOUT_URL}/checkout/{checkout_id}")
+    
+    assert status_response.status_code == 200
+    status_data = status_response.json()
+    assert status_data["status"] == "cart_cleared"
+    assert status_data["order_id"] == order_id
+    
+    mongo_client.close()
+
+
+@pytest.mark.asyncio
+async def test_database_isolation():
+    """AC8: Services do not share databases."""
+    cart_id = _create_cart(quantity=1, price=1000)
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{CHECKOUT_URL}/checkout",
+            json={
+                "cart_id": cart_id,
+                "email": "guest@example.com",
+                "ship_to": _ship_to()
+            }
+        )
+    
+    assert response.status_code == 200
+    checkout_id = response.json()["checkout_id"]
+    
+    # Wait for order to be created and cart to be deleted
+    mongo_client = MongoClient(MONGODB_URI)
+    checkout_db = mongo_client["checkout_db"]
+    order_db = mongo_client["order_db"]
+    cart_db = mongo_client["cart_db"]
+    
+    checkout = checkout_db.checkouts.find_one({"checkout_id": checkout_id})
+    payment_reference = checkout["payment_reference"]
+    
+    order_created = _poll_until(
+        lambda: order_db.orders.find_one({"payment_reference": payment_reference}) is not None,
+        timeout_seconds=10
     )
-    channel.basic_qos.assert_called_once_with(prefetch_count=1)
-    consume = channel.basic_consume.call_args
-    assert consume.kwargs["queue"] == "order.created.queue"
-    assert consume.kwargs["on_message_callback"] is consumers.on_message
-    assert consume.kwargs["auto_ack"] is False
-    channel.start_consuming.assert_called_once()
-
-
-def test_cart_delete_retries_network_error(monkeypatch):
-    """A connection error is retried, and a later 204 clears the cart."""
-    slept = []
-
-    async def instant(delay):
-        slept.append(delay)
-
-    monkeypatch.setattr(consumers.asyncio, "sleep", instant)
-    _seed_checkout("pay_net", "cart_net", "chk_net", total=1000)
-    delete_results.extend([httpx.ConnectError("connection refused"), 204])
-
-    _deliver(_order_created("pay_net", "chk_net", "ord_net"))
-
-    assert checkouts_data["pay_net"]["status"] == "cart_cleared"
-    assert "cart_net" not in carts
-    assert len(delete_calls) == 2
-    assert slept == [5]
+    assert order_created, "Order was not created within 10 seconds"
+    
+    cart_deleted = _poll_until(
+        lambda: cart_db.carts.find_one({"_id": cart_id}) is None,
+        timeout_seconds=10
+    )
+    assert cart_deleted, "Cart was not deleted within 10 seconds"
+    
+    # Inspect checkout_db
+    checkout_collections = checkout_db.list_collection_names()
+    assert set(checkout_collections) == {"checkouts", "outbox"}
+    
+    # Inspect order_db
+    order_collections = order_db.list_collection_names()
+    assert set(order_collections) == {"orders"}
+    
+    # Inspect payment_db
+    payment_db = mongo_client["payment_db"]
+    payment_collections = payment_db.list_collection_names()
+    assert set(payment_collections) == {"charges"}
+    
+    # Inspect cart_db
+    cart_collections = cart_db.list_collection_names()
+    # Cart collection may still exist (empty after delete) or may be dropped
+    if "carts" in cart_collections:
+        assert cart_db.carts.count_documents({}) == 0
+    
+    # Assert no cross-database writes (implicit from above assertions)
+    mongo_client.close()

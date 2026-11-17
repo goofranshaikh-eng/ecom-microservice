@@ -19,4 +19,10 @@ checkout_db.__getitem__.side_effect = _collection
 mongo_client = MagicMock(name="MongoClient")
 mongo_client.__getitem__.return_value = checkout_db
 
-patch("pymongo.MongoClient", return_value=mongo_client).start()
+# Unit tests import db and must see the mock client. Stop the patch afterwards
+# so the distributed-checkout integration tests can open a real MongoClient.
+_mongo_patch = patch("pymongo.MongoClient", return_value=mongo_client)
+_mongo_patch.start()
+import db  # noqa: E402
+
+_mongo_patch.stop()
