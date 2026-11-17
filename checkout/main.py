@@ -1,9 +1,11 @@
+import asyncio
 import os
 
 import uvicorn
 from fastapi import FastAPI
 
 import db
+from consumers import consume_order_created
 from routes import router
 
 app = FastAPI(
@@ -11,13 +13,22 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/docs",
     description=(
-        "Checkout orchestrates cart, payment, and order over HTTP. "
+        "Checkout charges a cart and stores an OrderRequested outbox row. "
+        "Consumes OrderCreated from RabbitMQ to empty carts. "
         "Public, no auth. [AUTH_DEFERRED]"
     ),
 )
-# checkout_db handle. v1 writes nothing; future sessions live here.
+# checkout_db handle. Checkouts and the outbox are stored here.
 app.state.db = db.db
 app.include_router(router)
+
+
+@app.on_event("startup")
+async def startup_event():
+    # Runs until the process exits. A broker outage is logged inside the task.
+    asyncio.create_task(consume_order_created())
+    print("OrderCreated consumer task started")
+
 
 if __name__ == "__main__":
     # Checkout listens on 8004 unless PORT is set. [CONFIG_DEFERRED]

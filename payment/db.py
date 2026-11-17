@@ -6,9 +6,10 @@ from pymongo import MongoClient
 # another service's database and never calls another service.
 #   _id: ObjectId
 #   amount_minor_units: integer (> 0)
-#   status: "accepted" | "refused"
-#   reference: string (UUID, only when accepted)
+#   status: "accepted" | "refused" | "refunded"
+#   reference: string (UUID, when accepted; kept when refunded)
 #   reason: string (only when refused)
+#   refunded_at: ISODate (UTC, set when status becomes "refunded")
 #   timestamp: ISODate (UTC)
 # [CURRENCY_DEFERRED] no currency field.
 # [MERCHANT_DEFERRED] no merchant_id.

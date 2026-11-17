@@ -1,8 +1,10 @@
+import asyncio
 import os
 
 import uvicorn
 from fastapi import FastAPI
 
+from consumers import consume_refund_requested
 from routes import router
 
 app = FastAPI(
@@ -15,6 +17,13 @@ app = FastAPI(
     ),
 )
 app.include_router(router)
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(consume_refund_requested())
+    print("RefundRequested consumer task started")
+
 
 if __name__ == "__main__":
     # Payment listens on 8005 unless PORT is set. [CONFIG_DEFERRED]

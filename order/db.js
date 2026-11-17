@@ -13,7 +13,7 @@ const { MongoClient } = require('mongodb');
 // [CONFIG_DEFERRED] URI comes from the environment; no .env loading.
 // [NO_RETRY] fail fast on connection errors. No pooling overrides.
 // [OPTIONAL_INDEXES] shopper_id, email, and created_at are created on connect.
-// [IDEMPOTENCY_DEFERRED] no unique index for a duplicate create.
+// [IDEMPOTENCY] payment_reference is unique so one order exists per payment.
 // [ORDER_ARCHIVAL_DEFERRED] no TTL index.
 // [AUDIT_LOG_DEFERRED] no audit_log collection.
 // [GRACEFUL_SHUTDOWN_DEFERRED] the client is not closed on SIGTERM.
@@ -27,6 +27,8 @@ async function connectDB() {
   await client.connect();
   const db = client.db('order_db');
   ordersCollection = db.collection('orders');
+
+  await ordersCollection.createIndex({ payment_reference: 1 }, { unique: true });
 
   // [OPTIONAL_INDEXES]
   await ordersCollection.createIndex({ shopper_id: 1 });

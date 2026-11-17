@@ -4,3 +4,6 @@ pymongo
 pydantic
 httpx
 email-validator
+pika
+pytest
+pytest-asyncio

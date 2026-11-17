@@ -6,7 +6,7 @@ const { getOrdersCollection } = require('./db');
 
 // Public, no auth. Any client can create or retrieve any order. [AUTH_DEFERRED]
 // [ORDER_OWNERSHIP_DEFERRED] GET does not check that the caller owns the order.
-// [IDEMPOTENCY_DEFERRED] a repeated POST /orders creates another order.
+// A repeated POST with the same payment_reference fails the unique index.
 // [PAGINATION_DEFERRED] no list endpoint.
 // [ORDER_UPDATES_DEFERRED] no PATCH.
 // [ORDER_CANCELLATION_DEFERRED] no DELETE or cancel.
