@@ -1,15 +1,29 @@
+import uuid
+from datetime import datetime
+
 import httpx
 from fastapi import APIRouter, HTTPException
+from pymongo.errors import PyMongoError
 
-from models import CheckoutRequest, CheckoutResponse
+from db import checkouts_collection, outbox_collection
+from models import (
+    CheckoutCreateResponse,
+    CheckoutLine,
+    CheckoutRecord,
+    CheckoutRequest,
+    OutboxRow,
+)
+from outbox import insert_outbox
 
 # Public, no auth. Any client can check out any cart. [AUTH_DEFERRED]
 # Checkout does not check that cart_id belongs to shopper_id. [CART_OWNERSHIP_DEFERRED]
-# [SERVICE_URLS_HARDCODED] future: CART_SERVICE_URL, PAYMENT_SERVICE_URL, ORDER_SERVICE_URL.
+# [SERVICE_URLS_HARDCODED] future: CART_SERVICE_URL, PAYMENT_SERVICE_URL.
 # [CONFIG_DEFERRED] service URLs are not read from the environment in v1.
 # [HTTP_TIMEOUT_DEFAULT] httpx default timeout is 5s.
 # [NO_RETRY] a downstream failure is returned immediately.
-# [IDEMPOTENCY_DEFERRED] a repeated checkout can charge again and create another order.
+# [IDEMPOTENCY_DEFERRED] concurrent submits for one cart can both pass the lookup.
+# [ATOMIC_WRITE_DEFERRED] pending checkout and outbox are two writes; a crash between them
+# leaves an accepted charge with no message to send.
 # [NO_TRANSACTIONS] partial failure is not atomic.
 # [EMAIL_DEFERRED] checkout does not send a confirmation email.
 # [STOCK_RESERVATION_DEFERRED] checkout does not reserve inventory.
@@ -18,17 +32,26 @@ from models import CheckoutRequest, CheckoutResponse
 # [LOGGING_DEFERRED] print statements only in v1.
 CART_SERVICE_URL = "http://localhost:8003"
 PAYMENT_SERVICE_URL = "http://localhost:8005"
-ORDER_SERVICE_URL = "http://localhost:8006"
+
+# A repeated checkout for these statuses returns the existing checkout and does not charge again.
+_IDEMPOTENT_STATUSES = ["accepted", "order_created", "cart_cleared"]
 
 router = APIRouter()
 
 
-def _log_cart_delete_failure(cart_id: str) -> None:
-    # [KNOWN_GAP] Order created but cart not emptied.
-    print(f"Failed to delete cart {cart_id} after checkout")
+def _checkout_lines(lines: list) -> list:
+    return [
+        CheckoutLine(
+            product_id=line["product_id"],
+            quantity=line["quantity"],
+            price_snapshot_minor_units=line["price_snapshot_minor_units"],
+        )
+        for line in lines
+    ]
 
 
-def _order_lines(lines: list) -> list:
+def _payload_lines(lines: list) -> list:
+    # OrderRequested carries price_minor_units. The checkout record keeps the cart snapshot name.
     return [
         {
             "product_id": line["product_id"],
@@ -39,34 +62,20 @@ def _order_lines(lines: list) -> list:
     ]
 
 
-def _order_payload(
-    body: CheckoutRequest, lines: list, total_minor_units: int, payment_reference: str
-) -> dict:
-    payload = {
-        "ship_to": body.ship_to.model_dump(),
-        "lines": _order_lines(lines),
-        "total_minor_units": total_minor_units,
-        "payment_reference": payment_reference,
-    }
-    if body.shopper_id is not None:
-        payload["shopper_id"] = body.shopper_id
-    if body.email is not None:
-        payload["email"] = str(body.email)
-    return payload
-
-
 @router.post(
     "/checkout",
-    response_model=CheckoutResponse,
+    response_model=CheckoutCreateResponse,
     response_model_exclude_none=True,
     summary="Check out a cart",
     description=(
         "Public, no auth. [AUTH_DEFERRED] "
         "Charges the cart total just returned by the cart service. "
-        "When payment accepts, stores an order and empties the cart. "
+        "When payment accepts, stores the checkout and an unpublished "
+        "OrderRequested outbox row, then returns the checkout id. "
+        "The order is created asynchronously. "
         "[CART_OWNERSHIP_DEFERRED] [SERVICE_URLS_HARDCODED] "
         "[HTTP_TIMEOUT_DEFAULT] [NO_RETRY] [IDEMPOTENCY_DEFERRED] "
-        "[NO_TRANSACTIONS] [KNOWN_GAP]"
+        "[ATOMIC_WRITE_DEFERRED] [NO_TRANSACTIONS]"
     ),
     responses={
         400: {
@@ -94,7 +103,7 @@ def _order_payload(
         },
     },
 )
-async def checkout(body: CheckoutRequest) -> CheckoutResponse:
+async def checkout(body: CheckoutRequest) -> CheckoutCreateResponse:
     if body.shopper_id is None and body.email is None:
         raise HTTPException(
             status_code=400, detail="Email is required for guest checkout"
@@ -120,52 +129,104 @@ async def checkout(body: CheckoutRequest) -> CheckoutResponse:
     cart_total = cart_data["total_minor_units"]
     cart_lines = cart_data["lines"]
 
+    # [IDEMPOTENCY_DEFERRED] two concurrent submits can both pass this lookup.
+    existing_checkout = checkouts_collection.find_one(
+        {
+            "cart_id": body.cart_id,
+            "status": {"$in": _IDEMPOTENT_STATUSES},
+        }
+    )
+    if existing_checkout:
+        return CheckoutCreateResponse(
+            checkout_id=existing_checkout["checkout_id"],
+            status="accepted",
+        )
+
+    checkout_id = str(uuid.uuid4())
+    payment_reference = str(uuid.uuid4())
+    now = datetime.utcnow()
+    email = str(body.email) if body.email else None
+
+    pending_checkout = CheckoutRecord(
+        checkout_id=checkout_id,
+        payment_reference=payment_reference,
+        cart_id=body.cart_id,
+        shopper_id=body.shopper_id,
+        email=email,
+        ship_to=body.ship_to,
+        lines=_checkout_lines(cart_lines),
+        total_minor_units=cart_total,
+        status="pending",
+        order_id=None,
+        created_at=now,
+        updated_at=now,
+    )
+    try:
+        checkouts_collection.insert_one(pending_checkout.model_dump(by_alias=True))
+    except PyMongoError:
+        raise HTTPException(
+            status_code=500, detail="Failed to store checkout"
+        ) from None
+
     try:
         async with httpx.AsyncClient() as client:
             payment_response = await client.post(
                 f"{PAYMENT_SERVICE_URL}/charge",
-                json={"amount_minor_units": cart_total},
+                json={
+                    "amount_minor_units": cart_total,
+                    "payment_reference": payment_reference,
+                },
             )
     except httpx.RequestError:
+        checkouts_collection.delete_one({"checkout_id": checkout_id})
         raise HTTPException(
             status_code=500, detail="Payment service unavailable"
         ) from None
 
     if payment_response.status_code != 200:
+        checkouts_collection.delete_one({"checkout_id": checkout_id})
         raise HTTPException(status_code=500, detail="Payment service unavailable")
 
     payment_data = payment_response.json()
     if payment_data["status"] == "refused":
-        return CheckoutResponse(status="refused", reason=payment_data["reason"])
+        checkouts_collection.update_one(
+            {"checkout_id": checkout_id},
+            {"$set": {"status": "refused", "updated_at": datetime.utcnow()}},
+        )
+        return CheckoutCreateResponse(
+            checkout_id=checkout_id,
+            status="refused",
+            reason=payment_data["reason"],
+        )
 
-    order_payload = _order_payload(
-        body, cart_lines, cart_total, payment_data["reference"]
+    # [ATOMIC_WRITE_DEFERRED] outbox is a second write. Roll back the pending checkout on failure.
+    outbox_row = OutboxRow(
+        event_type="OrderRequested",
+        payload={
+            "event_type": "OrderRequested",
+            "payment_reference": payment_reference,
+            "checkout_id": checkout_id,
+            "shopper_id": body.shopper_id,
+            "email": email,
+            "ship_to": body.ship_to.model_dump(),
+            "lines": _payload_lines(cart_lines),
+            "total_minor_units": cart_total,
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+        payment_reference=payment_reference,
+        published=False,
+        published_at=None,
+        created_at=datetime.utcnow(),
     )
     try:
-        async with httpx.AsyncClient() as client:
-            order_response = await client.post(
-                f"{ORDER_SERVICE_URL}/orders",
-                json=order_payload,
-            )
-    except httpx.RequestError:
-        # [KNOWN_GAP] Payment succeeded but order not created. The charge is not reversed.
-        raise HTTPException(
-            status_code=500, detail="Order service unavailable"
-        ) from None
+        insert_outbox(outbox_row)
+    except PyMongoError as exc:
+        print(f"Failed to store outbox for checkout {checkout_id}: {exc}")
+        checkouts_collection.delete_one({"checkout_id": checkout_id})
+        raise HTTPException(status_code=500, detail="Failed to store outbox") from None
 
-    if order_response.status_code != 201:
-        # [KNOWN_GAP] Payment succeeded but order not created. The charge is not reversed.
-        raise HTTPException(status_code=500, detail="Order service unavailable")
-
-    order_id = order_response.json()["order_id"]
-
-    try:
-        async with httpx.AsyncClient() as client:
-            delete_response = await client.delete(cart_url)
-    except httpx.RequestError:
-        _log_cart_delete_failure(body.cart_id)
-    else:
-        if delete_response.status_code != 204:
-            _log_cart_delete_failure(body.cart_id)
-
-    return CheckoutResponse(order_id=order_id, status="paid")
+    checkouts_collection.update_one(
+        {"checkout_id": checkout_id},
+        {"$set": {"status": "accepted", "updated_at": datetime.utcnow()}},
+    )
+    return CheckoutCreateResponse(checkout_id=checkout_id, status="accepted")

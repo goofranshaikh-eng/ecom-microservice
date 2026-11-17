@@ -11,11 +11,11 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/docs",
     description=(
-        "Checkout orchestrates cart, payment, and order over HTTP. "
+        "Checkout charges a cart and stores an OrderRequested outbox row. "
         "Public, no auth. [AUTH_DEFERRED]"
     ),
 )
-# checkout_db handle. v1 writes nothing; future sessions live here.
+# checkout_db handle. Checkouts and the outbox are stored here.
 app.state.db = db.db
 app.include_router(router)
 
