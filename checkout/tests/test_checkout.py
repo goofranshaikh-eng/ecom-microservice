@@ -8,6 +8,8 @@ from unittest.mock import MagicMock
 import httpx
 from bson import ObjectId
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
+from pymongo.errors import PyMongoError
 
 import completion_checker
 import relay
@@ -17,6 +19,7 @@ from db import client as mongo_client
 from db import db as checkout_db
 from db import outbox_collection
 from main import app
+from models import CheckoutStatusResponse
 
 client = TestClient(app)
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
@@ -163,10 +166,15 @@ def setup_function():
                         return row
         return None
 
+    def delete_many_checkouts(_query):
+        checkouts_data.clear()
+        return MagicMock(deleted_count=0)
+
     checkouts_collection.insert_one.side_effect = insert_one_checkouts
     checkouts_collection.find_one.side_effect = find_one_checkouts
     checkouts_collection.update_one.side_effect = update_one_checkouts
     checkouts_collection.delete_one.side_effect = delete_one_checkouts
+    checkouts_collection.delete_many.side_effect = delete_many_checkouts
     checkouts_collection.find.side_effect = None
     checkouts_collection.find.return_value = MagicMock(name="checkouts_find")
 
@@ -989,3 +997,206 @@ def test_checkout_status_refund_pending(monkeypatch):
     assert refund_row["published"] is False
     assert refund_row["payload"]["payment_reference"] == "pay_pending"
     assert refund_row["payload"]["checkout_id"] == "chk_pending"
+
+
+def _status_checkout(checkout_id, payment_reference, cart_id, **overrides):
+    checkout = {
+        "_id": ObjectId(),
+        "checkout_id": checkout_id,
+        "payment_reference": payment_reference,
+        "cart_id": cart_id,
+        "email": "guest@example.com",
+        "ship_to": {
+            "street": "123 Main St",
+            "city": "Springfield",
+            "postal_code": "12345",
+            "country": "US",
+        },
+        "lines": [
+            {"product_id": "prod_001", "quantity": 1, "price_snapshot_minor_units": 1000}
+        ],
+        "total_minor_units": 1000,
+        "status": "accepted",
+        "order_id": None,
+        "created_at": datetime(2025, 1, 10, 14, 30, 0),
+        "updated_at": datetime(2025, 1, 10, 14, 30, 0),
+    }
+    checkout.update(overrides)
+    return checkout
+
+
+def test_checkout_status_accepted():
+    checkouts_collection.delete_many({})
+    checkouts_collection.insert_one(
+        _status_checkout(
+            "chk_test_1",
+            "pay_test_1",
+            "cart_test_1",
+            lines=[
+                {
+                    "product_id": "prod_001",
+                    "quantity": 2,
+                    "price_snapshot_minor_units": 1500,
+                }
+            ],
+            total_minor_units=3000,
+            status="accepted",
+            order_id=None,
+        )
+    )
+
+    response = client.get("/checkout/chk_test_1")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["checkout_id"] == "chk_test_1"
+    assert body["status"] == "accepted"
+    assert body["order_id"] is None
+    assert body["created_at"] == "2025-01-10T14:30:00"
+
+
+def test_checkout_status_order_created():
+    checkouts_collection.delete_many({})
+    checkouts_collection.insert_one(
+        _status_checkout(
+            "chk_test_2",
+            "pay_test_2",
+            "cart_test_2",
+            status="order_created",
+            order_id="ord_test_1",
+            created_at=datetime(2025, 1, 10, 14, 30, 5),
+            updated_at=datetime(2025, 1, 10, 14, 30, 5),
+        )
+    )
+
+    response = client.get("/checkout/chk_test_2")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["checkout_id"] == "chk_test_2"
+    assert body["status"] == "order_created"
+    assert body["order_id"] == "ord_test_1"
+    assert body["created_at"] == "2025-01-10T14:30:05"
+
+
+def test_checkout_status_cart_cleared():
+    checkouts_collection.delete_many({})
+    checkouts_collection.insert_one(
+        _status_checkout(
+            "chk_test_3",
+            "pay_test_3",
+            "cart_test_3",
+            status="cart_cleared",
+            order_id="ord_test_2",
+            created_at=datetime(2025, 1, 10, 14, 30, 10),
+            updated_at=datetime(2025, 1, 10, 14, 30, 15),
+        )
+    )
+
+    response = client.get("/checkout/chk_test_3")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["checkout_id"] == "chk_test_3"
+    assert body["status"] == "cart_cleared"
+    assert body["order_id"] == "ord_test_2"
+    assert body["created_at"] == "2025-01-10T14:30:10"
+
+
+def test_checkout_status_refunded():
+    checkouts_collection.delete_many({})
+    checkouts_collection.insert_one(
+        _status_checkout(
+            "chk_test_4",
+            "pay_test_4",
+            "cart_test_4",
+            status="refunded",
+            order_id=None,
+            created_at=datetime(2025, 1, 10, 14, 35, 0),
+            updated_at=datetime(2025, 1, 10, 14, 40, 0),
+        )
+    )
+
+    response = client.get("/checkout/chk_test_4")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["checkout_id"] == "chk_test_4"
+    assert body["status"] == "refunded"
+    assert body["order_id"] is None
+    assert body["created_at"] == "2025-01-10T14:35:00"
+
+
+def test_checkout_not_found():
+    checkouts_collection.delete_many({})
+
+    response = client.get("/checkout/chk_missing")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Checkout not found"}
+
+
+def test_checkout_status_missing_created_at():
+    checkouts_collection.delete_many({})
+    checkout = _status_checkout("chk_old", "pay_old", "cart_old")
+    del checkout["created_at"]
+    checkouts_collection.insert_one(checkout)
+
+    response = client.get("/checkout/chk_old")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["checkout_id"] == "chk_old"
+    assert body["status"] == "accepted"
+    assert body["created_at"] == "1970-01-01T00:00:00Z"
+
+
+def test_checkout_status_missing_status_field():
+    checkouts_collection.delete_many({})
+    checkout = _status_checkout(
+        "chk_old_status", "pay_old_status", "cart_old_status"
+    )
+    del checkout["status"]
+    checkouts_collection.insert_one(checkout)
+
+    response = client.get("/checkout/chk_old_status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["checkout_id"] == "chk_old_status"
+    assert body["status"] == "accepted"
+    assert body["order_id"] is None
+
+
+def test_checkout_status_requires_order_id_when_order_exists():
+    try:
+        CheckoutStatusResponse(
+            checkout_id="chk_missing_order",
+            status="order_created",
+            created_at="2025-01-10T14:30:00",
+        )
+    except ValidationError as exc:
+        assert "order_id must be present" in str(exc)
+    else:
+        raise AssertionError("expected validation error")
+
+    try:
+        CheckoutStatusResponse(
+            checkout_id="chk_missing_order",
+            status="cart_cleared",
+            order_id=None,
+            created_at="2025-01-10T14:30:00",
+        )
+    except ValidationError as exc:
+        assert "order_id must be present" in str(exc)
+    else:
+        raise AssertionError("expected validation error")
+
+
+def test_checkout_status_database_query_failed():
+    checkouts_collection.find_one.side_effect = PyMongoError("down")
+
+    response = client.get("/checkout/chk_db_down")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Database query failed"}

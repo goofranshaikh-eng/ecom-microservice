@@ -11,6 +11,7 @@ from models import (
     CheckoutLine,
     CheckoutRecord,
     CheckoutRequest,
+    CheckoutStatusResponse,
     OutboxRow,
 )
 from outbox import insert_outbox
@@ -230,3 +231,62 @@ async def checkout(body: CheckoutRequest) -> CheckoutCreateResponse:
         {"$set": {"status": "accepted", "updated_at": datetime.utcnow()}},
     )
     return CheckoutCreateResponse(checkout_id=checkout_id, status="accepted")
+
+
+@router.get(
+    "/checkout/{checkout_id}",
+    response_model=CheckoutStatusResponse,
+    summary="Fetch checkout status",
+    description=(
+        "Public endpoint (no authorization in v1). [AUTH_DEFERRED] "
+        "Returns the checkout status, order id (when the order has been created), "
+        "and created timestamp. "
+        "The status is one of: accepted (checkout stored, order not yet created), "
+        "order_created (order exists but cart not yet cleared), "
+        "cart_cleared (happy path complete), "
+        "or refunded (order never appeared, charge refunded)."
+    ),
+    responses={
+        404: {
+            "description": "Checkout not found",
+            "content": {
+                "application/json": {"example": {"detail": "Checkout not found"}}
+            },
+        },
+        500: {
+            "description": "Database query failed",
+            "content": {
+                "application/json": {"example": {"detail": "Database query failed"}}
+            },
+        },
+    },
+)
+def get_checkout_status(checkout_id: str) -> CheckoutStatusResponse:
+    try:
+        checkout = checkouts_collection.find_one({"checkout_id": checkout_id})
+    except PyMongoError:
+        # [ERROR_DETAIL_DEFERRED] fixed message; the response has no stack trace.
+        print(
+            f"[ERROR_DETAIL_DEFERRED] Database query failed for checkout_id {checkout_id}"
+        )
+        raise HTTPException(status_code=500, detail="Database query failed") from None
+
+    if checkout is None:
+        raise HTTPException(status_code=404, detail="Checkout not found")
+
+    # [BACKFILL_DEFERRED] status is missing for checkouts created before Story 1.
+    status = checkout.get("status", "accepted")
+
+    created_at = checkout.get("created_at")
+    if created_at is None:
+        # [BACKFILL_DEFERRED] created_at is missing for checkouts created before Story 1.
+        created_at_str = "1970-01-01T00:00:00Z"
+    else:
+        created_at_str = created_at.isoformat()
+
+    return CheckoutStatusResponse(
+        checkout_id=checkout["checkout_id"],
+        status=status,
+        order_id=checkout.get("order_id"),
+        created_at=created_at_str,
+    )

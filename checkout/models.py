@@ -66,3 +66,18 @@ class CheckoutCreateResponse(BaseModel):
         if self.status == "refused" and self.reason is None:
             raise ValueError("reason must be present when status is refused")
         return self
+
+
+class CheckoutStatusResponse(BaseModel):
+    checkout_id: str
+    status: Literal["accepted", "order_created", "cart_cleared", "refunded"]
+    order_id: Optional[str] = None
+    created_at: str  # ISO 8601 timestamp
+
+    @model_validator(mode="after")
+    def order_id_present_when_order_exists(self):
+        if self.status in ("order_created", "cart_cleared") and self.order_id is None:
+            raise ValueError(
+                "order_id must be present when status is order_created or cart_cleared"
+            )
+        return self
