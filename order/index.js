@@ -6,12 +6,14 @@ const swaggerJsdoc = require('swagger-jsdoc');
 
 const { connectDB } = require('./db');
 const routes = require('./routes');
+const { consumeOrderRequested } = require('./consumer');
+const { closeRabbitMQ } = require('./rabbitmq');
 
 // [AUTH_DEFERRED] every endpoint is public.
 // [HEALTH_CHECK_DEFERRED] no /health endpoint.
 // [LOGGING_DEFERRED] console logging only.
 // [CONFIG_DEFERRED] PORT and MONGODB_URI come from the environment; no .env loading.
-// [GRACEFUL_SHUTDOWN_DEFERRED] no SIGTERM handler.
+// [GRACEFUL_SHUTDOWN] SIGTERM and SIGINT close the RabbitMQ connection.
 // [TESTS_EXTERNAL] integration tests run outside this package.
 // [VERSION_CURRENT] dependency pins live in package.json.
 // Order does not call any other service. [AD-2]
@@ -46,7 +48,8 @@ app.use('/orders', routes);
 
 // Order listens on 8006 unless PORT is set.
 connectDB()
-  .then(() => {
+  .then(async () => {
+    await consumeOrderRequested();
     app.listen(port, () => {
       console.log(`Order service running on port ${port}`);
       console.log(`Swagger UI: http://localhost:${port}/docs`);
@@ -57,3 +60,15 @@ connectDB()
     console.error('Failed to connect to database:', err);
     process.exit(1);
   });
+
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, closing RabbitMQ connection');
+  await closeRabbitMQ();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Received SIGINT, closing RabbitMQ connection');
+  await closeRabbitMQ();
+  process.exit(0);
+});
