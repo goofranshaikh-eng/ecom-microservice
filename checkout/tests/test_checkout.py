@@ -929,3 +929,63 @@ def test_completion_checker_requests_refund_for_expired_checkout(monkeypatch):
     assert stored["outbox"]["payment_reference"] == "pay_window"
     assert stored["update_query"] == {"_id": checkout_oid}
     assert stored["update"]["$set"]["status"] == "refund_pending"
+
+
+def test_checkout_status_refund_pending(monkeypatch):
+    """AC6: Completion checker updates checkout status to refund_pending."""
+    checkout_oid = ObjectId()
+    now = datetime.utcnow() - timedelta(minutes=6)
+    checkout = {
+        "_id": checkout_oid,
+        "checkout_id": "chk_pending",
+        "payment_reference": "pay_pending",
+        "cart_id": "cart_pending",
+        "email": "guest@example.com",
+        "ship_to": _ship_to(),
+        "lines": [
+            {"product_id": "prod_001", "quantity": 1, "price_snapshot_minor_units": 1000}
+        ],
+        "total_minor_units": 1000,
+        "status": "accepted",
+        "order_id": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    checkouts_data["chk_pending"] = checkout
+
+    def find(query):
+        assert query["status"] == "accepted"
+        assert "$lt" in query["created_at"]
+        return [checkout]
+
+    def insert_one(row):
+        outbox_data[str(row["_id"])] = row
+
+    def update_one(query, update):
+        assert query == {"_id": checkout_oid}
+        checkout.update(update["$set"])
+
+    checkouts_collection.find.side_effect = find
+    outbox_collection.insert_one.side_effect = insert_one
+    checkouts_collection.update_one.side_effect = update_one
+
+    def stop(_seconds):
+        raise RuntimeError("stop-poll")
+
+    monkeypatch.setattr(completion_checker.time, "sleep", stop)
+
+    try:
+        completion_checker.check_expired_checkouts()
+    except RuntimeError as exc:
+        assert str(exc) == "stop-poll"
+
+    updated_checkout = checkouts_collection.find_one({"checkout_id": "chk_pending"})
+    assert updated_checkout["status"] == "refund_pending"
+
+    refund_row = outbox_collection.find_one(
+        {"payment_reference": "pay_pending", "event_type": "RefundRequested"}
+    )
+    assert refund_row is not None
+    assert refund_row["published"] is False
+    assert refund_row["payload"]["payment_reference"] == "pay_pending"
+    assert refund_row["payload"]["checkout_id"] == "chk_pending"
